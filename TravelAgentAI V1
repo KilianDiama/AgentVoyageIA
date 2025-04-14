@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+TravelAgentAI – Agent de voyage Intelligent
+
+Ce module implémente un agent de voyage complet inspiré par :
+  - Les classes d’interaction, de cache et de planification de tâches (InteractionManager, TaskScheduler).
+  - Les modules d’analyse de sentiment et de NLP.
+  - Des composants de visualisation dynamique.
+  - Des idées du code Boostia.py, AIQuantumOptimizer v1.0.py et du système d’« eesaiez D.d'A matthieu ouvrard.py ».
+
+Fonctionnalités principales :
+  • Traitement et gestion des requêtes utilisateur (via InteractionManager)
+  • Analyse de sentiment et classification de l’intention de la requête
+  • Récupération simulée d’offres de voyage (vols, hôtels, activités)
+  • Génération d’un itinéraire personnalisé (via ItineraryPlanner)
+  • Mise en cache des résultats pour accélérer les réponses récurrentes
+  • Planification d’une tâche périodique de mise à jour des offres
+  • Visualisation synthétique des données de voyage (Dashboard)
+
+Auteur : ChatGPT Matthieu ouvrard
+Date   : 2025-04-14
+"""
+
+import asyncio
+import os
+import json
+import time
+import logging
+import random
+import base64
+import hashlib
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+
+# Pour la visualisation interactive
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Pour la partie API
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+import uvicorn
+
+# Pour la partie NLP & sentiment
+from transformers import pipeline
+from langdetect import detect
+
+# Pour la planification de tâches
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+# ------------------------ GESTION DU LOGGER ------------------------ #
+def setup_logger(name: str, log_file: Optional[str] = None, level: int = logging.INFO) -> logging.Logger:
+    logger_obj = logging.getLogger(name)
+    logger_obj.setLevel(level)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger_obj.addHandler(ch)
+    # Optionnel : handler fichier
+    if log_file:
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(formatter)
+        logger_obj.addHandler(fh)
+    return logger_obj
+
+logger = setup_logger("TravelAgentAI", log_file="travel_agent.log")
+
+# ------------------------ CACHE MANAGER ------------------------ #
+class CacheManager:
+    """
+    Gère un cache simple via le système de fichiers (vous pourrez le remplacer par Redis par exemple).
+    """
+    def __init__(self, cache_dir: str = "cache", ttl: int = 3600):
+        self.cache_dir = cache_dir
+        self.ttl = ttl
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _get_path(self, key: str) -> str:
+        return os.path.join(self.cache_dir, f"{key}.json")
+
+    def get(self, key: str) -> Optional[Any]:
+        path = self._get_path(key)
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            # Vérifier la date d'expiration
+            if time.time() - data.get("timestamp", 0) < self.ttl:
+                logger.info(f"Cache hit pour la clé {key}")
+                return data.get("value")
+            else:
+                os.remove(path)
+        logger.info(f"Cache miss pour la clé {key}")
+        return None
+
+    def set(self, key: str, value: Any):
+        path = self._get_path(key)
+        data = {"timestamp": time.time(), "value": value}
+        with open(path, "w") as f:
+            json.dump(data, f)
+        logger.info(f"Valeur mise en cache pour la clé {key}")
+
+# ------------------------ TASK SCHEDULER ------------------------ #
+class TaskScheduler:
+    """
+    Planifie et exécute des tâches périodiques.
+    """
+    def __init__(self):
+        self.scheduler = AsyncIOScheduler()
+        self.scheduler.start()
+        logger.info("TaskScheduler initialisé et démarré.")
+
+    def schedule_task(self, func, interval_seconds: int, task_name: Optional[str] = None, **kwargs):
+        try:
+            self.scheduler.add_job(
+                func,
+                IntervalTrigger(seconds=interval_seconds),
+                id=task_name or func.__name__,
+                kwargs=kwargs,
+            )
+            logger.info(f"Tâche '{task_name or func.__name__}' planifiée toutes les {interval_seconds} secondes.")
+        except Exception as e:
+            logger.error(f"Erreur lors de la planification de la tâche : {e}")
+
+    def stop_task(self, task_name: str):
+        try:
+            self.scheduler.remove_job(task_name)
+            logger.info(f"Tâche '{task_name}' arrêtée avec succès.")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'arrêt de la tâche '{task_name}' : {e}")
+
+    def shutdown(self):
+        self.scheduler.shutdown()
+        logger.info("TaskScheduler arrêté.")
+
+# ------------------------ SENTIMENT ANALYZER ------------------------ #
+class SentimentAnalyzer:
+    """
+    Analyse le sentiment d’un texte (utilisation d’un pipeline transformers).
+    """
+    def __init__(self, model_name: str = "distilbert-base-uncased-finetuned-sst-2-english"):
+        self.pipeline = pipeline("sentiment-analysis", model=model_name)
+        logger.info(f"SentimentAnalyzer initialisé avec le modèle {model_name}")
+
+    def detect_language(self, text: str) -> str:
+        try:
+            language = detect(text)
+            logger.info(f"Langue détectée : {language}")
+            return language
+        except Exception as e:
+            logger.warning(f"Erreur de détection de langue : {e}")
+            return "unknown"
+
+    def analyze_sentiment(self, text: str, target_language: str = "en") -> Dict[str, Any]:
+        try:
+            # Si la langue détectée n'est pas la langue cible, on pourrait traduire
+            lang = self.detect_language(text)
+            if lang != target_language:
+                # Pour l'exemple, nous passons directement en anglais, sinon traduction
+                logger.info("Traduction nécessaire (simulée)")
+            logger.info("Analyse du sentiment en cours...")
+            result = self.pipeline(text)[0]
+            logger.info(f"Résultat sentiment : {result}")
+            return {"label": result["label"], "score": result["score"], "language": lang}
+        except Exception as e:
+            logger.error(f"Erreur lors de l'analyse du sentiment : {e}")
+            return {"label": "error", "score": 0.0, "language": "unknown"}
+
+# ------------------------ ITINERARY PLANNER ------------------------ #
+class ItineraryPlanner:
+    """
+    Génère un itinéraire personnalisé en fonction d'une requête utilisateur.
+    Dans cet exemple, le système simule des suggestions d'itinéraire.
+    """
+    def __init__(self):
+        # Simuler des données de voyage (liste d'hôtels, de vols, d'activités)
+        self.hotels = [
+            {"name": "Hôtel Paradis", "rating": 4.8, "price": 120},
+            {"name": "Hôtel Évasion", "rating": 4.5, "price": 100},
+            {"name": "Hôtel Confort", "rating": 4.2, "price": 80},
+        ]
+        self.flights = [
+            {"airline": "Air France", "price": 250, "duration": "2h30"},
+            {"airline": "EasyJet", "price": 180, "duration": "2h45"},
+            {"airline": "Ryanair", "price": 150, "duration": "2h50"},
+        ]
+        self.activities = [
+            {"activity": "Visite du musée", "price": 15},
+            {"activity": "Dîner gastronomique", "price": 50},
+            {"activity": "Excursion en bateau", "price": 30},
+        ]
+        logger.info("ItineraryPlanner initialisé avec des données de voyage simulées.")
+
+    def plan_itinerary(self, user_query: str) -> Dict[str, Any]:
+        # Pour cet exemple, nous filtrons aléatoirement (mais vous pouvez utiliser NLP pour extraire les préférences)
+        selected_hotel = random.choice(self.hotels)
+        selected_flight = random.choice(self.flights)
+        selected_activity = random.choice(self.activities)
+        # Générer un itinéraire synthétique
+        itinerary = {
+            "flight": selected_flight,
+            "hotel": selected_hotel,
+            "activity": selected_activity,
+            "note": f"Itinéraire basé sur la requête : '{user_query}'."
+        }
+        logger.info(f"Itinéraire généré : {itinerary}")
+        return itinerary
+
+# ------------------------ INTERACTION MANAGER ------------------------ #
+class InteractionManager:
+    """
+    Gère les interactions utilisateur avec prise en charge du cache et du pipeline asynchrone.
+    Inspiré du code transmis.
+    """
+    def __init__(self, pipeline_manager: Any, cache_manager: Optional[CacheManager] = None):
+        self.pipeline_manager = pipeline_manager  # typiquement, le TravelAgent principal
+        self.cache_manager = cache_manager
+
+    async def handle_request(self, user_id: str, data: Any, **kwargs) -> Dict[str, Any]:
+        cache_key = f"user_{user_id}_request_{hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()}"
+        if self.cache_manager:
+            cached_result = self.cache_manager.get(cache_key)
+            if cached_result:
+                logger.info(f"Cache hit pour l'utilisateur {user_id}")
+                return cached_result
+
+        logger.info(f"Traitement de la requête pour l'utilisateur {user_id}...")
+        result = await self.pipeline_manager.process_query(user_id, data, **kwargs)
+        if self.cache_manager:
+            self.cache_manager.set(cache_key, result)
+        return result
+
+    async def handle_batch_request(self, user_id: str, batch_data: List[Any], **kwargs) -> List[Dict[str, Any]]:
+        tasks = [self.handle_request(user_id, data, **kwargs) for data in batch_data]
+        return await asyncio.gather(*tasks)
+
+# ------------------------ MAIN SYSTEM – TRAVEL AGENT ------------------------ #
+class TravelAgent:
+    """
+    Système central de l’agent de voyage.
+    Intègre l’analyse de sentiment, la recherche d’offres de voyage, la génération d’itinéraire,
+    et la gestion d’interactions.
+    """
+    def __init__(self):
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.itinerary_planner = ItineraryPlanner()
+        self.cache_manager = CacheManager()
+        # Pour le pipeline principal, nous définissons process_query comme méthode asynchrone
+        self.interaction_manager = InteractionManager(pipeline_manager=self, cache_manager=self.cache_manager)
+        # Simuler une source de données de voyage (mise à jour périodique)
+        self.travel_offers = self._load_initial_offers()
+        # Scheduler pour mettre à jour les offres périodiquement
+        self.task_scheduler = TaskScheduler()
+        self.task_scheduler.schedule_task(self.update_offers, interval_seconds=3600, task_name="update_offers")
+
+    def _load_initial_offers(self) -> Dict[str, List[Dict[str, Any]]]:
+        # Chargement simulé d'offres de voyage
+        offers = {
+            "hotels": [
+                {"name": "Hôtel Paradis", "rating": 4.8, "price": 120},
+                {"name": "Hôtel Évasion", "rating": 4.5, "price": 100},
+                {"name": "Hôtel Confort", "rating": 4.2, "price": 80},
+            ],
+            "flights": [
+                {"airline": "Air France", "price": 250, "duration": "2h30"},
+                {"airline": "EasyJet", "price": 180, "duration": "2h45"},
+                {"airline": "Ryanair", "price": 150, "duration": "2h50"},
+            ],
+            "activities": [
+                {"activity": "Visite du musée", "price": 15},
+                {"activity": "Dîner gastronomique", "price": 50},
+                {"activity": "Excursion en bateau", "price": 30},
+            ],
+        }
+        logger.info("Offres de voyage initialisées.")
+        return offers
+
+    async def update_offers(self):
+        """
+        Tâche périodique (exécutée par le TaskScheduler) qui simule la mise à jour des offres.
+        Vous pourriez par exemple interroger une API tierce.
+        """
+        logger.info("Mise à jour des offres de voyage en cours...")
+        # Simuler une légère modification aléatoire des prix
+        for category in self.travel_offers:
+            for offer in self.travel_offers[category]:
+                delta = random.uniform(-5, 5)
+                if "price" in offer:
+                    offer["price"] = max(10, round(offer["price"] + delta, 2))
+        logger.info("Offres de voyage mises à jour.")
+
+    async def process_query(self, user_id: str, query_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """
+        Traite une requête de l'utilisateur.
+        query_data devrait contenir au moins le champ "message" (requête utilisateur).
+        """
+        user_message = query_data.get("message")
+        if not user_message:
+            logger.error("Message utilisateur manquant.")
+            return {"error": "Message vide ou invalide."}
+
+        # Analyse du sentiment pour ajuster la réponse (par exemple, mieux conseiller en cas de stress)
+        sentiment_result = self.sentiment_analyzer.analyze_sentiment(user_message)
+        
+        # Ici vous pourriez ajouter une analyse d'intention (ex. recherche d’un vol, réservation d’hôtel, etc.)
+        # Pour cet exemple, nous utilisons la requête directement
+
+        # Générer un itinéraire personnalisé via ItineraryPlanner.
+        itinerary = self.itinerary_planner.plan_itinerary(user_message)
+
+        # Intégrer le sentiment dans la réponse (en modifiant par exemple le ton ou en proposant des conseils additionnels)
+        response_text = (
+            f"Votre requête a été analysée (sentiment: {sentiment_result['label']} avec confiance {sentiment_result['score']:.2f}).\n"
+            f"Voici une suggestion d'itinéraire personnalisé :\n"
+            f"  - Vol : {itinerary['flight']['airline']} (Prix: {itinerary['flight']['price']}€, Durée: {itinerary['flight']['duration']})\n"
+            f"  - Hôtel : {itinerary['hotel']['name']} (Note: {itinerary['hotel']['rating']}, Prix: {itinerary['hotel']['price']}€)\n"
+            f"  - Activité : {itinerary['activity']['activity']} (Prix: {itinerary['activity']['price']}€)\n"
+            f"{itinerary['note']}"
+        )
+        # Simuler une visualisation du résumé d'offres (par exemple, moyenne des prix ou rating)
+        summary_data = {
+            "Vols (€)": np.mean([flt["price"] for flt in self.travel_offers["flights"]]),
+            "Hôtels (€)": np.mean([htl["price"] for htl in self.travel_offers["hotels"]]),
+            "Activités (€)": np.mean([act["price"] for act in self.travel_offers["activities"]])
+        }
+        # Générer un graphique interactif avec Plotly
+        fig = go.Figure(data=go.Bar(x=list(summary_data.keys()), y=list(summary_data.values())))
+        fig.update_layout(title="Résumé des Offres de Voyage", template="plotly_white")
+        # Sauvegarder la figure (facultatif)
+        visual_path = os.path.join("dashboards", f"{user_id}_travel_dashboard.html")
+        os.makedirs("dashboards", exist_ok=True)
+        fig.write_html(visual_path)
+        
+        # Retourner l'ensemble de la réponse
+        result = {
+            "response_text": response_text,
+            "sentiment": sentiment_result,
+            "itinerary": itinerary,
+            "visualization_path": visual_path,
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info(f"Requête traitée pour l'utilisateur {user_id}")
+        return result
+
+    async def process_batch(self, user_id: str, queries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        tasks = [self.interaction_manager.handle_request(user_id, q) for q in queries]
+        return await asyncio.gather(*tasks)
+
+# ------------------------ FASTAPI APP ------------------------ #
+app = FastAPI(title="TravelAgentAI", version="1.0")
+
+# Instanciation unique du TravelAgent
+travel_agent = TravelAgent()
+
+@app.post("/travel_query")
+async def travel_query(request: Request):
+    """
+    Endpoint principal pour soumettre une requête de voyage.
+    Exemple de payload JSON :
+    {
+       "user_id": "user123",
+       "message": "Je veux partir en vacances en Espagne, que me suggérez-vous ?"
+    }
+    """
+    body = await request.json()
+    user_id = body.get("user_id", "anonymous")
+    result = await travel_agent.interaction_manager.handle_request(user_id, body)
+    return result
+
+@app.post("/travel_batch")
+async def travel_batch(request: Request):
+    """
+    Endpoint pour traiter un lot de requêtes.
+    Exemple de payload JSON :
+    {
+       "user_id": "user123",
+       "queries": [
+            {"message": "Je cherche des vols bon marché pour Paris."},
+            {"message": "Quels hôtels recommandez-vous à Rome ?"}
+       ]
+    }
+    """
+    body = await request.json()
+    user_id = body.get("user_id", "anonymous")
+    queries = body.get("queries", [])
+    if not queries:
+        raise HTTPException(status_code=400, detail="Liste de requêtes vide.")
+    results = await travel_agent.process_batch(user_id, queries)
+    return results
+
+@app.get("/dashboard/{user_id}")
+async def get_dashboard(user_id: str):
+    """
+    Renvoie le chemin du tableau de bord généré pour l'utilisateur.
+    (Les fichiers HTML générés par Plotly peuvent ensuite être affichés dans un navigateur.)
+    """
+    dashboard_path = os.path.join("dashboards", f"{user_id}_travel_dashboard.html")
+    if not os.path.exists(dashboard_path):
+        raise HTTPException(status_code=404, detail="Tableau de bord non trouvé.")
+    return {"dashboard_path": dashboard_path}
+
+# ------------------------ WEBSOCKET POUR MISE À JOUR DES OFFRES ------------------------ #
+active_connections = set()
+
+@app.websocket("/ws/offers")
+async def websocket_offers(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.add(websocket)
+    try:
+        while True:
+            # Envoyer périodiquement un résumé des offres
+            summary = {
+                "hotels_avg_price": np.mean([htl["price"] for htl in travel_agent.travel_offers["hotels"]]),
+                "flights_avg_price": np.mean([flt["price"] for flt in travel_agent.travel_offers["flights"]]),
+                "activities_avg_price": np.mean([act["price"] for act in travel_agent.travel_offers["activities"]])
+            }
+            fig = go.Figure(data=go.Bar(x=list(summary.keys()), y=list(summary.values())))
+            fig.update_layout(title="Offres de Voyage en Direct", template="plotly_white")
+            json_data = fig.to_json()
+            await websocket.send_text(json_data)
+            await asyncio.sleep(10)
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
+        logger.info("Client websocket déconnecté.")
+
+# ------------------------ MAIN ------------------------ #
+if __name__ == "__main__":
+    # Pour lancer le serveur FastAPI avec uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
